@@ -1,0 +1,128 @@
+from datetime import datetime, timedelta
+import pandas as pd
+from azure.kusto.data import KustoClient, KustoConnectionStringBuilder, ClientRequestProperties
+from azure.kusto.data.exceptions import KustoServiceError, KustoNetworkError
+from azure.kusto.data.helpers import dataframe_from_result_table
+import concurrent.futures
+import time
+
+# Authentication details
+cluster = "https://azcore.centralus.kusto.windows.net/"
+kcsb = KustoConnectionStringBuilder.with_az_cli_authentication(cluster)
+client = KustoClient(kcsb)
+
+# Database and GPU VM types
+database = "AzureCP"
+gpu_vm_types = [
+    'Standard_NC6', 'Standard_NC12', 'Standard_NC24', 'Standard_NC24r', 
+    'Standard_NC40ads_H100_v5', 'Standard_NC80adis_H100_v5', 'Standard_NC6s_v2', 
+    'Standard_NC12s_v2', 'Standard_NC24s_v2', 'Standard_NC24rs_v2', 'Standard_NC6s_v3', 
+    'Standard_NC12s_v3', 'Standard_NC24s_v3', 'Standard_NC24rs_v3', 'Standard_NC4as_T4_v3', 
+    'Standard_NC8as_T4_v3', 'Standard_NC16as_T4_v3', 'Standard_NC64as_T4_v3', 
+    'Standard_NC24ads_A100_v4', 'Standard_NC48ads_A100_v4', 'Standard_NC96ads_A100_v4', 
+    'Standard_ND96asr_A100_v4', 'Standard_ND96amsr_A100_v4', 'Standard_ND6s', 'Standard_ND12s', 
+    'Standard_ND24s', 'Standard_ND24rs', 'Standard_ND40rs_v2', 'Standard_ND96isr_H100_v5', 
+    'Standard_ND96isr_MI300X_v5', 'Standard_NG8ads_V620_v1', 'Standard_NG16ads_V620_v1', 
+    'Standard_NG32ads_V620_v1', 'Standard_NG32adms_V620_v1', 'Standard_NV6', 'Standard_NV12', 
+    'Standard_NV24', 'Standard_NV12s_v3', 'Standard_NV24s_v3', 'Standard_NV48s_v3', 
+    'Standard_NV4as_v4', 'Standard_NV8as_v4', 'Standard_NV16as_v4', 'Standard_NV32as_v4', 
+    'Standard_NV6ads_A10_v5', 'Standard_NV12ads_A10_v5', 'Standard_NV18ads_A10_v5', 
+    'Standard_NV36ads_A10_v5', 'Standard_NV36adms_A10_v5', 'Standard_NV72ads_A10_v5'
+]
+
+# Start and end time for the query
+start_time = datetime(2024, 5, 18)
+end_time = datetime(2024, 5, 19)
+
+# Retry settings
+max_retries = 5
+retry_delay = 15  # seconds
+
+# Function to execute query
+def execute_query(query_start, query_end):
+    query = f"""
+    let starttime = datetime({query_start.strftime('%Y-%m-%d %H:%M:%S')});
+    let endtime = datetime({query_end.strftime('%Y-%m-%d %H:%M:%S')});
+    let AzCoreKusto = entity_group [
+       cluster('https://azcore1.southeastasia.kusto.windows.net'),
+       cluster('https://azcore2.australiaeast.kusto.windows.net'),
+       cluster('https://azcore3.brazilsouth.kusto.windows.net'),
+       cluster('https://azcore4.canadacentral.kusto.windows.net'),
+       cluster('https://azcore5.northeurope.kusto.windows.net'),
+       cluster('https://azcore6.westeurope.kusto.windows.net'),
+       cluster('https://azcore7.francecentral.kusto.windows.net'),
+       cluster('https://azcore8.japaneast.kusto.windows.net'),
+       cluster('https://azcore9.uksouth.kusto.windows.net'),
+       cluster('https://azcore10.centralus.kusto.windows.net'),
+       cluster('https://azcore11.southcentralus.kusto.windows.net'),
+       cluster('https://azcore12.eastus.kusto.windows.net'),
+       cluster('https://azcore13.eastus2.kusto.windows.net'),
+       cluster('https://azcore14.westus2.kusto.windows.net'),
+       cluster('https://azcore15.westus3.kusto.windows.net'),
+       cluster('https://azcore16.eastasia.kusto.windows.net'),
+       cluster('https://azcore17.centralindia.kusto.windows.net')
+    ];
+
+    let gpu_vm_types = dynamic({gpu_vm_types});
+
+    let container_details = database('AzureCP').MycroftContainerSnapshot
+    | where PolicyName in (gpu_vm_types)
+    | where PreciseTimeStamp between (starttime .. endtime)
+    | summarize by ContainerId, PolicyName;
+
+    let materialized_container_details = materialize(container_details);
+
+    let cpu_utilization = macro-expand isfuzzy=true AzCoreKusto as data (
+        materialized_container_details
+        | join kind=inner (
+            data.database('Fa').VmCounterFiveMinuteRoleInstanceCentralBondTable
+            | where PreciseTimeStamp between (starttime .. endtime)
+            | where CounterName == "Percentage CPU"
+        ) on $left.ContainerId == $right.VmId
+    );
+
+    cpu_utilization
+    | extend TimeBin = bin(PreciseTimeStamp, 1h)
+    | summarize 
+        avg_cpu_util = round(avg(AverageCounterValue), 4), 
+        median_cpu_util = round(percentile(AverageCounterValue, 50), 4), 
+        p99_cpu_util = round(percentile(AverageCounterValue, 99), 4) 
+        by PolicyName, TimeBin
+    | order by TimeBin
+    """
+
+    retries = 0
+    while retries < max_retries:
+        try:
+            properties = ClientRequestProperties()
+            properties.set_option(ClientRequestProperties.request_timeout_option_name, timedelta(minutes=10))
+            response = client.execute(database, query, properties=properties)
+            dataframe = dataframe_from_result_table(response.primary_results[0])
+            return dataframe
+        except (KustoServiceError, KustoNetworkError) as e:
+            retries += 1
+            print(f"Attempt {retries} failed: {e}. Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    else:
+        print(f"Failed to execute query for period {query_start} to {query_end} after {max_retries} attempts.")
+        return None
+
+# Generate list of hourly time ranges over 5 days
+time_ranges = [(start_time + timedelta(hours=i), start_time + timedelta(hours=i+1)) for i in range(0, int((end_time - start_time).total_seconds() / 3600))]
+
+# Use concurrent processing to run queries in parallel
+all_results = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    futures = [executor.submit(execute_query, start, end) for start, end in time_ranges]
+    for future in concurrent.futures.as_completed(futures):
+        result = future.result()
+        if result is not None:
+            all_results.append(result)
+
+# Concatenate all results into a single DataFrame
+final_dataframe = pd.concat(all_results)
+
+# Save the final DataFrame to a CSV file
+final_dataframe.to_csv("cpu_utilization_results_test_days.csv", index=False)
+
+print("Aggregated results saved to cpu_utilization_results_test_days.csv")
